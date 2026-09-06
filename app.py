@@ -494,7 +494,7 @@ st.markdown(
     <div class="hh-topbar">
         <div class="hh-brand">
             HACKER HOUSE GOA
-            <span>PROJECTAIM / SKOPEO</span>
+            <span>SKOPEO</span>
         </div>
         <div class="hh-nav">
             <span>CHECK PIPELINE</span>
