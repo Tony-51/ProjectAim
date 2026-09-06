@@ -1,0 +1,9 @@
+streamlit
+opencv-python
+numpy
+Pillow
+requests
+beautifulsoup4
+opencv-python-headless
+python-dotenv
+playwright>=1.50,<2

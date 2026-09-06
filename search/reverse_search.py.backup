@@ -1,0 +1,372 @@
+import os
+import json
+import os
+import json
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+from PIL import Image
+
+load_dotenv()
+
+
+def _get_serpapi_key():
+    """Read SerpApi key from local environment or Streamlit Cloud secrets.
+
+    Streamlit Cloud secrets are read defensively so a TOML/configuration
+    problem is not silently converted into a misleading "key missing" error.
+    """
+    key = os.getenv("SERPAPI_KEY")
+    if key and str(key).strip():
+        return str(key).strip()
+
+    try:
+        import streamlit as st
+        secrets = st.secrets
+
+        # Normal Streamlit Cloud format:
+        # SERPAPI_KEY = "your-key"
+        key = secrets.get("SERPAPI_KEY")
+        if key and str(key).strip():
+            return str(key).strip()
+
+        # Also tolerate a nested [default] or [secrets] section if the
+        # credential was stored that way.
+        for section in ("default", "secrets"):
+            try:
+                key = secrets.get(section, {}).get("SERPAPI_KEY")
+            except AttributeError:
+                key = None
+            if key and str(key).strip():
+                return str(key).strip()
+    except Exception as exc:
+        # Keep the original exception available to diagnostics rather than
+        # hiding a malformed/misread Streamlit secrets file.
+        os.environ["PROJECTAIM_SECRETS_ERROR"] = str(exc)
+
+    return None
+
+
+def get_serpapi_key():
+    """Public compatibility wrapper used by the app."""
+    return _get_serpapi_key()
+
+
+def prepare_image_for_serpapi(image_path):
+    """
+    Resize/compress the image so it stays below
+    SerpApi's 500 KB upload limit.
+    """
+
+    output_path = "data/serpapi_upload.jpg"
+
+    os.makedirs("data", exist_ok=True)
+
+    image = Image.open(image_path).convert("RGB")
+
+    # Keep dimensions reasonable
+    max_dimension = 1600
+
+    width, height = image.size
+
+    if max(width, height) > max_dimension:
+
+        scale = max_dimension / max(width, height)
+
+        new_size = (
+            int(width * scale),
+            int(height * scale)
+        )
+
+        image = image.resize(
+            new_size,
+            Image.LANCZOS
+        )
+
+    # Try progressively lower JPEG quality
+    for quality in [90, 80, 70, 60, 50, 40]:
+
+        image.save(
+            output_path,
+            format="JPEG",
+            quality=quality,
+            optimize=True
+        )
+
+        file_size = os.path.getsize(output_path)
+
+        print(
+            f"Prepared image: "
+            f"{file_size / 1024:.1f} KB "
+            f"(quality={quality})"
+        )
+
+        if file_size <= 450 * 1024:
+            break
+
+    # Final safety check
+    final_size = os.path.getsize(output_path)
+
+    if final_size > 500 * 1024:
+
+        raise RuntimeError(
+            f"Could not compress image below SerpApi's "
+            f"500 KB limit. Current size: "
+            f"{final_size / 1024:.1f} KB"
+        )
+
+    return output_path
+
+
+def search_google_lens(image_path, search_type="visual_matches", query=None, api_key=None):
+
+    api_key = str(api_key).strip() if api_key else _get_serpapi_key()
+
+    if not api_key:
+        secrets_error = os.getenv("PROJECTAIM_SECRETS_ERROR")
+        detail = f" Streamlit secrets error: {secrets_error}" if secrets_error else ""
+        raise ValueError(
+            "SERPAPI_KEY is not available. Expected SERPAPI_KEY in the local environment "
+            "or as a top-level Streamlit Cloud secret named SERPAPI_KEY." + detail
+        )
+
+    # --------------------------------------------------
+    # Prepare image
+    # --------------------------------------------------
+
+    upload_path = prepare_image_for_serpapi(
+        image_path
+    )
+
+    print(
+        f"Uploading compressed image: {upload_path}"
+    )
+
+    # --------------------------------------------------
+    # 1. Upload image to SerpApi
+    # --------------------------------------------------
+
+    with open(upload_path, "rb") as image_file:
+
+        response = requests.post(
+            "https://serpapi.com/image",
+
+            files={
+                "image": (
+                    "face.jpg",
+                    image_file,
+                    "image/jpeg"
+                )
+            },
+
+            data={
+                "api_key": api_key
+            },
+
+            timeout=60
+        )
+
+    # Better error message
+    if not response.ok:
+
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = response.text
+
+        raise RuntimeError(
+            f"SerpApi image upload failed "
+            f"(HTTP {response.status_code}): "
+            f"{error_data}"
+        )
+
+    upload_data = response.json()
+
+    if "image_id" not in upload_data:
+
+        raise RuntimeError(
+            f"Image upload failed: {upload_data}"
+        )
+
+    image_id = upload_data["image_id"]
+
+    print("Image uploaded successfully!")
+    print("Image ID:", image_id)
+
+    # --------------------------------------------------
+    # 2. Google Lens search
+    # --------------------------------------------------
+
+    params = {
+        "engine": "google_lens",
+        "image_id": image_id,
+        "type": search_type,
+        "hl": "en",
+        "country": "in",
+        "api_key": api_key
+    }
+
+    if query:
+        params["q"] = query
+
+    response = requests.get(
+        "https://serpapi.com/search",
+        params=params,
+
+        timeout=60
+    )
+
+    if not response.ok:
+
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = response.text
+
+        raise RuntimeError(
+            f"Google Lens search failed "
+            f"(HTTP {response.status_code}): "
+            f"{error_data}"
+        )
+
+    results = response.json()
+
+    return results
+
+
+def save_results(results):
+
+    """
+    Save the complete Lens response and a simplified
+    candidate list for the next stage.
+    """
+
+    os.makedirs("data", exist_ok=True)
+
+    # --------------------------------------------------
+    # Save complete API response
+    # --------------------------------------------------
+
+    with open(
+        "data/lens_results.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            results,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    # --------------------------------------------------
+    # Extract visual matches
+    # --------------------------------------------------
+
+    visual_matches = results.get(
+        "visual_matches",
+        []
+    )
+
+    candidates = []
+
+    for match in visual_matches:
+
+        candidate = {
+            "title": match.get("title"),
+            "source": match.get("source"),
+            "link": match.get("link"),
+            "image": match.get("image"),
+            "thumbnail": match.get("thumbnail"),
+            "snippet": match.get("snippet")
+        }
+
+        candidates.append(candidate)
+
+    # --------------------------------------------------
+    # Save simplified candidates
+    # --------------------------------------------------
+
+    with open(
+        "data/lens_candidates.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            candidates,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    return candidates
+
+
+if __name__ == "__main__":
+
+    image_path = "data/test.jpg"
+
+    results = search_google_lens(
+        image_path
+    )
+
+    candidates = save_results(
+        results
+    )
+
+    print(
+        "\nGoogle Lens search completed!"
+    )
+
+    print(
+        "Number of visual matches:",
+        len(candidates)
+    )
+
+    print("\nTop results:")
+
+    for i, candidate in enumerate(
+        candidates[:10],
+        start=1
+    ):
+
+        print(
+            f"\n--- Match {i} ---"
+        )
+
+        print(
+            "Title:",
+            candidate["title"]
+        )
+
+        print(
+            "Source:",
+            candidate["source"]
+        )
+
+        print(
+            "Link:",
+            candidate["link"]
+        )
+
+    print(
+        "\n--------------------------------"
+    )
+
+    print(
+        "Results saved successfully!"
+    )
+
+    print(
+        "--------------------------------"
+    )
+
+    print(
+        "data/lens_results.json"
+    )
+
+    print(
+        "data/lens_candidates.json"
+    )
